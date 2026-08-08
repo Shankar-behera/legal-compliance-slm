@@ -1,139 +1,339 @@
 """
-Pulls real regulatory/legal text from Hugging Face's `pile-of-law/pile-of-law`
-dataset and writes it to `data/raw/dapt/*.txt`, where `chunk_text.py` picks
-it up. This replaces manually sourcing DAPT text — you don't hand-collect
-10-20M tokens, you stream them from an existing public legal corpus.
+Download legal text from the Pile-of-Law repository for DAPT.
 
-Streamed (`streaming=True`), so it never loads a full subset into memory —
-required to stay inside Colab's ~12GB system RAM, same constraint
-`chunk_text.py` is built around.
+IMPORTANT:
+The current Hugging Face `datasets` library no longer supports the
+legacy pile-of-law.py loading script. Therefore this script downloads
+the underlying .jsonl.xz files directly from the Hugging Face dataset
+repository and streams/decompresses them line-by-line.
 
-Default subsets are the ones most relevant to a *compliance* auditor
-(rather than e.g. case law or contracts), out of pile-of-law's ~35
-available configs:
-    - cfr              Code of Federal Regulations
-    - eurlex           EU legislation (GDPR-adjacent)
-    - privacy_policies Real privacy policy text
-    - tos              Real Terms of Service text (complements the
-                        LexGLUE unfair_tos SFT source — DAPT sees the
-                        vocabulary, SFT sees labeled violations of it)
+Output:
+    data/raw/dapt/cfr.txt
+    data/raw/dapt/eurlex.txt
+    data/raw/dapt/tos.txt
+    ...
 
-Usage:
-    python data/scripts/download_corpus.py \
-        --subsets cfr eurlex privacy_policies tos \
-        --max_docs_per_subset 1500 \
-        --output_dir data/raw/dapt
+Each JSONL record contains a `text` field.
+
+Designed for Google Colab with limited RAM.
 """
+
 import argparse
+import json
+import lzma
 import os
-from typing import List
+from typing import Dict, List
 
-from datasets import load_dataset
+import requests
 
-AVAILABLE_SUBSETS = {
-    "cfr",
-    "eurlex",
-    "privacy_policies",
-    "tos",
-    "uscode",
-    "state_codes",
-    "constitutions",
-    "echr",
+
+# ---------------------------------------------------------------------
+# Current Pile-of-Law repository
+# ---------------------------------------------------------------------
+
+BASE_URL = (
+    "https://huggingface.co/datasets/"
+    "pile-of-law/pile-of-law/resolve/main/data/"
+)
+
+
+# These names correspond to files that currently exist in the
+# Pile-of-Law repository.
+#
+# NOTE:
+# privacy_policies is intentionally NOT included because it is not
+# present as a current Pile-of-Law repository subset.
+AVAILABLE_SUBSETS: Dict[str, str] = {
+    "cfr": "train.cfr.jsonl.xz",
+    "eurlex": "train.eurlex.jsonl.xz",
+    "tos": "train.tos.jsonl.xz",
+    "state_codes": "train.state_code.jsonl.xz",
+    "uscode": "train.uscode.jsonl.xz",
+    "echr": "train.echr.jsonl.xz",
+    "federal_register": "train.federal_register.jsonl.xz",
+    "tax_rulings": "train.taxrulings.jsonl.xz",
+    "us_bills": "train.us_bills.jsonl.xz",
+    "euro_parl": "train.euro_parl.jsonl.xz",
+    "frcp": "train.frcp.jsonl.xz",
 }
 
-DEFAULT_SUBSETS = ["cfr", "eurlex", "privacy_policies", "tos"]
 
-# Rough chars-per-token estimate for a stopping-criterion proxy only — the
-# real, exact token count is computed later by chunk_text.py's tokenizer.
-# This just avoids downloading far more raw text than the DAPT target
-# (10-20M tokens) needs.
+DEFAULT_SUBSETS = [
+    "cfr",
+    "eurlex",
+    "tos",
+]
+
+
+# Rough chars/token estimate.
+# This is ONLY used as an early stopping approximation.
+# Exact token counting is still performed later by chunk_text.py.
 APPROX_CHARS_PER_TOKEN = 4
 
+
+# ---------------------------------------------------------------------
+# Streaming download
+# ---------------------------------------------------------------------
+
+def stream_jsonl_xz(
+    url: str,
+    output_file,
+    max_docs: int,
+    max_chars: int,
+) -> tuple[int, int]:
+
+    n_docs = 0
+    n_chars = 0
+
+    print(f"  Source: {url}")
+
+    with requests.get(
+        url,
+        stream=True,
+        timeout=120,
+    ) as response:
+
+        response.raise_for_status()
+
+        # requests gives us compressed bytes.
+        # We wrap the response stream with an XZ decompressor.
+        with lzma.open(
+            response.raw,
+            mode="rt",
+            encoding="utf-8",
+            errors="replace",
+        ) as xz_stream:
+
+            for line in xz_stream:
+
+                if not line.strip():
+                    continue
+
+                try:
+                    example = json.loads(line)
+                except json.JSONDecodeError:
+                    print(
+                        f"  Warning: skipping malformed JSON "
+                        f"record at document {n_docs + 1}"
+                    )
+                    continue
+
+                text = example.get("text", "")
+
+                if not isinstance(text, str):
+                    continue
+
+                text = text.strip()
+
+                if not text:
+                    continue
+
+                output_file.write(text)
+                output_file.write("\n\n")
+
+                n_docs += 1
+                n_chars += len(text)
+
+                if n_docs >= max_docs:
+                    break
+
+                if n_chars >= max_chars:
+                    break
+
+    return n_docs, n_chars
+
+
+# ---------------------------------------------------------------------
+# Download one subset
+# ---------------------------------------------------------------------
 
 def download_subset(
     subset: str,
     output_dir: str,
     max_docs: int,
     max_chars: int,
-    trust_remote_code: bool = True,
-) -> int:
+) -> tuple[int, int]:
+
     if subset not in AVAILABLE_SUBSETS:
+
         raise ValueError(
-            f"Unknown subset '{subset}'. Known compliance-relevant subsets: "
-            f"{sorted(AVAILABLE_SUBSETS)}. See the pile-of-law dataset card "
-            f"on Hugging Face for the full list if you want a different one."
+            f"Unknown subset '{subset}'.\n\n"
+            f"Available subsets:\n"
+            f"  {', '.join(sorted(AVAILABLE_SUBSETS))}\n\n"
+            f"Note: privacy_policies is NOT a current "
+            f"Pile-of-Law subset."
         )
 
-    dataset = load_dataset(
-        "pile-of-law/pile-of-law",
-        subset,
-        split="train",
-        streaming=True,
-        trust_remote_code=trust_remote_code,
+    filename = AVAILABLE_SUBSETS[subset]
+
+    url = BASE_URL + filename
+
+    output_path = os.path.join(
+        output_dir,
+        f"{subset}.txt",
     )
 
-    out_path = os.path.join(output_dir, f"{subset}.txt")
-    n_docs = 0
-    n_chars = 0
+    print()
+    print("=" * 70)
+    print(f"Downloading subset: {subset}")
+    print(f"Maximum documents: {max_docs:,}")
+    print(
+        f"Maximum characters: {max_chars:,} "
+        f"(~{max_chars // APPROX_CHARS_PER_TOKEN:,} tokens)"
+    )
+    print("=" * 70)
 
-    with open(out_path, "w", encoding="utf-8") as out_f:
-        for example in dataset:
-            text = example.get("text", "")
-            if not text or not text.strip():
-                continue
+    # Remove an old partial file so that a rerun doesn't accidentally
+    # append duplicate documents.
+    if os.path.exists(output_path):
+        print(f"  Removing existing file: {output_path}")
+        os.remove(output_path)
 
-            out_f.write(text.strip() + "\n\n")
-            n_docs += 1
-            n_chars += len(text)
+    with open(
+        output_path,
+        "w",
+        encoding="utf-8",
+    ) as output_file:
 
-            if n_docs >= max_docs or n_chars >= max_chars:
-                break
+        n_docs, n_chars = stream_jsonl_xz(
+            url=url,
+            output_file=output_file,
+            max_docs=max_docs,
+            max_chars=max_chars,
+        )
 
-    return n_docs
+    print(f"  Documents written : {n_docs:,}")
+    print(f"  Characters written: {n_chars:,}")
+    print(f"  Output            : {output_path}")
 
+    return n_docs, n_chars
+
+
+# ---------------------------------------------------------------------
+# Main corpus downloader
+# ---------------------------------------------------------------------
 
 def download_corpus(
     subsets: List[str],
     output_dir: str,
     max_docs_per_subset: int,
     max_tokens_per_subset: int,
-    trust_remote_code: bool = True,
 ) -> None:
-    os.makedirs(output_dir, exist_ok=True)
-    max_chars_per_subset = max_tokens_per_subset * APPROX_CHARS_PER_TOKEN
+
+    os.makedirs(
+        output_dir,
+        exist_ok=True,
+    )
+
+    max_chars_per_subset = (
+        max_tokens_per_subset
+        * APPROX_CHARS_PER_TOKEN
+    )
+
+    total_docs = 0
+    total_chars = 0
+
+    print()
+    print("Pile-of-Law DAPT downloader")
+    print("-" * 70)
+    print(f"Output directory: {output_dir}")
+    print(f"Subsets: {', '.join(subsets)}")
+    print(
+        f"Target tokens/subset: "
+        f"{max_tokens_per_subset:,}"
+    )
+    print(
+        f"Maximum documents/subset: "
+        f"{max_docs_per_subset:,}"
+    )
+    print("-" * 70)
 
     for subset in subsets:
-        print(f"Downloading '{subset}' (up to {max_docs_per_subset} docs / "
-              f"~{max_tokens_per_subset:,} tokens)...")
-        n_docs = download_subset(
+
+        n_docs, n_chars = download_subset(
             subset=subset,
             output_dir=output_dir,
             max_docs=max_docs_per_subset,
             max_chars=max_chars_per_subset,
-            trust_remote_code=trust_remote_code,
         )
-        print(f"  wrote {n_docs} documents to {output_dir}/{subset}.txt")
 
+        total_docs += n_docs
+        total_chars += n_chars
+
+    print()
+    print("=" * 70)
+    print("DOWNLOAD COMPLETE")
+    print("=" * 70)
+
+    print(
+        f"Total documents : {total_docs:,}"
+    )
+
+    print(
+        f"Total characters: {total_chars:,}"
+    )
+
+    print(
+        f"Approx. tokens  : "
+        f"{total_chars // APPROX_CHARS_PER_TOKEN:,}"
+    )
+
+    print(
+        f"Output directory: {output_dir}"
+    )
+
+    print("=" * 70)
+
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--subsets", nargs="+", default=DEFAULT_SUBSETS,
-        help=f"pile-of-law configs to pull. Known: {sorted(AVAILABLE_SUBSETS)}",
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Stream legal text directly from "
+            "Pile-of-Law Hugging Face files."
+        )
     )
-    parser.add_argument("--output_dir", default="data/raw/dapt")
-    parser.add_argument("--max_docs_per_subset", type=int, default=1500)
+
     parser.add_argument(
-        "--max_tokens_per_subset", type=int, default=5_000_000,
-        help="Approximate stopping point per subset — real token count is "
-             "measured later by chunk_text.py, this is just to avoid "
-             "over-downloading raw text.",
+        "--subsets",
+        nargs="+",
+        default=DEFAULT_SUBSETS,
+        help=(
+            "Pile-of-Law subsets to download. "
+            f"Available: {sorted(AVAILABLE_SUBSETS)}"
+        ),
     )
+
     parser.add_argument(
-        "--no_trust_remote_code", action="store_true",
-        help="Disable trust_remote_code if your datasets version doesn't need it "
-             "(newer parquet-based dataset versions on the Hub often don't).",
+        "--output_dir",
+        default="data/raw/dapt",
+        help="Directory where .txt files will be written.",
     )
+
+    parser.add_argument(
+        "--max_docs_per_subset",
+        type=int,
+        default=1500,
+        help=(
+            "Maximum number of documents per subset."
+        ),
+    )
+
+    parser.add_argument(
+        "--max_tokens_per_subset",
+        type=int,
+        default=5_000_000,
+        help=(
+            "Approximate token limit per subset. "
+            "Exact token count is performed later "
+            "by chunk_text.py."
+        ),
+    )
+
     args = parser.parse_args()
 
     download_corpus(
@@ -141,7 +341,6 @@ def main() -> None:
         output_dir=args.output_dir,
         max_docs_per_subset=args.max_docs_per_subset,
         max_tokens_per_subset=args.max_tokens_per_subset,
-        trust_remote_code=not args.no_trust_remote_code,
     )
 
 

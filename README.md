@@ -24,7 +24,7 @@
 
 A production-shaped reference implementation for adapting a small foundation model to a narrow domain — legal/regulatory compliance auditing — entirely within the memory and session-time limits of a free-tier GPU. Not a single notebook: a config-driven pipeline, a benchmarked base/DAPT/SFT comparison, a served inference API, and CI that catches regressions before they cost GPU time.
 
-> ⚠️ **This is a portfolio/reference project, not a legal tool.** See the [Model Card](docs/MODEL_CARD.md) for intended use, limitations, and ethical considerations before using any output from this model for anything beyond demonstration.
+> ⚠️ **This is a portfolio project , not a legal tool.** See the [Model Card](docs/MODEL_CARD.md) for intended use, limitations, and ethical considerations before using any output from this model for anything beyond demonstration.
 
 ---
 
