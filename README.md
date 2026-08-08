@@ -24,7 +24,7 @@
 
 A production-shaped reference implementation for adapting a small foundation model to a narrow domain — legal/regulatory compliance auditing — entirely within the memory and session-time limits of a free-tier GPU. Not a single notebook: a config-driven pipeline, a benchmarked base/DAPT/SFT comparison, a served inference API, and CI that catches regressions before they cost GPU time.
 
-> ⚠️ **This is a portfolio/reference project, not a legal tool.** See the [Model Card](docs/MODEL_CARD.md) for intended use, limitations, and ethical considerations before using any output from this model for anything beyond demonstration.
+> ⚠️ **This is a portfolio project, not a legal tool.** See the [Model Card](docs/MODEL_CARD.md) for intended use, limitations, and ethical considerations before using any output from this model for anything beyond demonstration.
 
 ---
 
@@ -240,13 +240,4 @@ ollama run legal-compliance-slm "A vendor stores customer PII for 7 years with n
 See [`docs/MODEL_CARD.md`](docs/MODEL_CARD.md) for intended use, out-of-scope use, training data provenance, known limitations (hallucinated citations, narrow domain coverage, small-model reasoning limits), and ethical considerations.
 
 ---
-
-## What Makes This Read as Senior-Level
-
-- Config-driven training (`configs/*.yaml`) instead of hardcoded hyperparameters in notebook cells
-- Code lives in `src/`, is unit-testable, notebooks are thin orchestration layers
-- Explicit checkpoint-to-Drive strategy as a stated design decision against Colab's timeout constraint
-- DAPT (domain vocabulary) separated from SFT (task behavior) as a real architectural choice, not just "fine-tuning"
-- A measured base/DAPT/SFT benchmark table, not just a loss curve
-- Export path all the way to a locally-runnable artifact (GGUF + Ollama) and a served API, proving the model isn't Colab-only
-- CI that enforces the above stays true as the repo grows
+ true as the repo grows
