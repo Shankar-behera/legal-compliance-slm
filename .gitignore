@@ -1,0 +1,10 @@
+data/raw/
+models/checkpoints/
+models/gguf/*.gguf
+wandb/
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/
+*.egg-info/
+.pytest_cache/
