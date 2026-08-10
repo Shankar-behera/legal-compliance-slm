@@ -133,7 +133,14 @@ def build_records(
     include_fair_examples: bool = False,
     seed: int = 42,
 ) -> List[Dict[str, str]]:
-    dataset = load_dataset("lex_glue", "unfair_tos", split="train")
+    # "lex_glue" (no namespace) is a legacy script-based dataset that
+    # modern `datasets`/`huggingface_hub` versions can't load — it fails
+    # even before reaching the "scripts unsupported" error, in URI
+    # parsing (HfUriError: canonical/no-namespace repo ids trip up the
+    # newer parsing path). "coastalcph/lex_glue" is the maintained,
+    # namespaced dataset — already converted to plain Parquet with no
+    # loading script, so it works on any `datasets` version.
+    dataset = load_dataset("coastalcph/lex_glue", "unfair_tos", split="train")
 
     violation_records: List[Dict[str, str]] = []
     fair_texts: List[str] = []
