@@ -31,6 +31,7 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
+from transformers.trainer_utils import get_last_checkpoint
 
 from src.data.dapt_dataset import load_dapt_dataset
 from src.training.callbacks import DriveCheckpointGuard, LossSpikeMonitor
@@ -135,7 +136,15 @@ def run_dapt(config_path: str) -> str:
     )
 
     # Train and save
-    trainer.train()
+    # Train and resume from the latest checkpoint if one exists
+    last_checkpoint = get_last_checkpoint(cfg["output_dir"])
+
+    if last_checkpoint is not None:
+        print(f"Resuming DAPT from checkpoint: {last_checkpoint}")
+        trainer.train(resume_from_checkpoint=last_checkpoint)
+    else:
+        print("No checkpoint found. Starting DAPT from scratch.")
+        trainer.train()
 
     final_dir = f"{cfg['output_dir']}/final_adapter"
     trainer.save_model(final_dir)
