@@ -1,169 +1,293 @@
 """
-Pulls real regulatory/legal text from Hugging Face's `pile-of-law/pile-of-law`
-dataset and writes it to `data/raw/dapt/*.txt`, where `chunk_text.py` picks
-it up. This replaces manually sourcing DAPT text — you don't hand-collect
-10-20M tokens, you stream them from an existing public legal corpus.
+Download legal text from the Pile-of-Law repository for DAPT.
 
-Streamed (`streaming=True`), so it never loads a full subset into memory —
-required to stay inside Colab's ~12GB system RAM, same constraint
-`chunk_text.py` is built around.
+IMPORTANT:
+The current Hugging Face `datasets` library no longer supports the
+legacy pile-of-law.py loading script (`RuntimeError: Dataset scripts
+are no longer supported`), and pile-of-law has no `refs/convert/parquet`
+mirror to fall back on either (`RevisionNotFoundError` — the Hub never
+generated one for this dataset). So this script bypasses `datasets`
+entirely: it downloads the underlying .jsonl.xz files directly from the
+Hugging Face dataset repository over HTTP and streams/decompresses them
+line-by-line. The config->filename mapping below is copied from
+pile-of-law's own loading script (`pile-of-law.py`'s `_DATA_URL` dict),
+not guessed — verified against the dataset repo directly.
 
-Default subsets are the ones most relevant to a *compliance* auditor
-(rather than e.g. case law or contracts), out of pile-of-law's ~35
-available configs:
-    - cfr              Code of Federal Regulations
-    - eurlex           EU legislation (GDPR-adjacent)
-    - privacy_policies Real privacy policy text
-    - tos              Real Terms of Service text (complements the
-                        LexGLUE unfair_tos SFT source — DAPT sees the
-                        vocabulary, SFT sees labeled violations of it)
+Output:
+    data/raw/dapt/cfr.txt
+    data/raw/dapt/eurlex.txt
+    data/raw/dapt/tos.txt
+    ...
 
-pile-of-law is a script-based dataset (a `pile-of-law.py` loading
-script on the Hub, not plain Parquet/Arrow files), and `datasets>=3.0`
-removed support for loading scripts entirely — `trust_remote_code`
-no longer overrides that, it just silently does nothing. The fix is
-to load from the Hub's auto-generated Parquet mirror instead of the
-default branch: every dataset gets one at `refs/convert/parquet`,
-built directly from the underlying data files without running the
-loading script at all, so it works the same on any `datasets` version.
+Each JSONL record contains a `text` field.
+
+Designed for Google Colab with limited RAM: streams and decompresses
+one line at a time, never holds a full subset in memory, and never
+downloads the .xz file to disk before decompressing it.
 
 Usage:
     python data/scripts/download_corpus.py \
-        --subsets cfr eurlex privacy_policies tos \
+        --subsets cfr eurlex tos \
         --max_docs_per_subset 1500 \
         --output_dir data/raw/dapt
 """
+
 import argparse
+import json
+import lzma
 import os
-from typing import List
+import time
+from typing import Dict, List, Tuple
 
-from datasets import load_dataset
+import requests
 
-AVAILABLE_SUBSETS = {
-    "cfr",
-    "eurlex",
-    "privacy_policies",
-    "tos",
-    "uscode",
-    "state_codes",
-    "constitutions",
-    "echr",
+
+# ---------------------------------------------------------------------
+# Current Pile-of-Law repository
+# ---------------------------------------------------------------------
+
+BASE_URL = (
+    "https://huggingface.co/datasets/"
+    "pile-of-law/pile-of-law/resolve/main/data/"
+)
+
+
+# Config name -> filename, copied directly from pile-of-law.py's own
+# _DATA_URL dict (single-file configs only — a few pile-of-law configs
+# like atticus_contracts and courtlistener_opinions are sharded across
+# multiple files and are intentionally not included here since none of
+# them are relevant to a compliance DAPT corpus anyway).
+#
+# NOTE: privacy_policies is intentionally NOT included — it is not a
+# real pile-of-law config (an earlier draft of this script assumed it
+# was; it isn't in the dataset's own _DATA_URL mapping).
+AVAILABLE_SUBSETS: Dict[str, str] = {
+    "cfr": "train.cfr.jsonl.xz",
+    "eurlex": "train.eurlex.jsonl.xz",
+    "tos": "train.tos.jsonl.xz",
+    "state_codes": "train.state_code.jsonl.xz",
+    "uscode": "train.uscode.jsonl.xz",
+    "echr": "train.echr.jsonl.xz",
+    "federal_register": "train.federal_register.jsonl.xz",
+    "tax_rulings": "train.taxrulings.jsonl.xz",
+    "us_bills": "train.us_bills.jsonl.xz",
+    "euro_parl": "train.euro_parl.jsonl.xz",
+    "frcp": "train.frcp.jsonl.xz",
 }
 
-DEFAULT_SUBSETS = ["cfr", "eurlex", "privacy_policies", "tos"]
+DEFAULT_SUBSETS = ["cfr", "eurlex", "tos"]
 
-# Rough chars-per-token estimate for a stopping-criterion proxy only — the
-# real, exact token count is computed later by chunk_text.py's tokenizer.
-# This just avoids downloading far more raw text than the DAPT target
-# (10-20M tokens) needs.
+# Rough chars/token estimate.
+# This is ONLY used as an early stopping approximation.
+# Exact token counting is still performed later by chunk_text.py.
 APPROX_CHARS_PER_TOKEN = 4
 
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 5
+
+
+# ---------------------------------------------------------------------
+# Streaming download
+# ---------------------------------------------------------------------
+
+def stream_jsonl_xz(
+    url: str,
+    output_file,
+    max_docs: int,
+    max_chars: int,
+) -> Tuple[int, int]:
+    n_docs = 0
+    n_chars = 0
+
+    print(f"  Source: {url}")
+
+    last_error: Exception = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            with requests.get(url, stream=True, timeout=120) as response:
+                response.raise_for_status()
+
+                # requests gives us compressed bytes.
+                # We wrap the response stream with an XZ decompressor.
+                with lzma.open(
+                    response.raw,
+                    mode="rt",
+                    encoding="utf-8",
+                    errors="replace",
+                ) as xz_stream:
+
+                    for line in xz_stream:
+                        if not line.strip():
+                            continue
+
+                        try:
+                            example = json.loads(line)
+                        except json.JSONDecodeError:
+                            print(
+                                f"  Warning: skipping malformed JSON "
+                                f"record at document {n_docs + 1}"
+                            )
+                            continue
+
+                        text = example.get("text", "")
+                        if not isinstance(text, str):
+                            continue
+
+                        text = text.strip()
+                        if not text:
+                            continue
+
+                        output_file.write(text)
+                        output_file.write("\n\n")
+
+                        n_docs += 1
+                        n_chars += len(text)
+
+                        if n_docs >= max_docs or n_chars >= max_chars:
+                            break
+
+            return n_docs, n_chars
+
+        except (requests.exceptions.RequestException, lzma.LZMAError) as e:
+            last_error = e
+            if attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF_SECONDS * attempt
+                print(f"  Attempt {attempt}/{MAX_RETRIES} failed ({e}); retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"  All {MAX_RETRIES} attempts failed for {url}")
+
+    raise RuntimeError(f"Failed to download {url} after {MAX_RETRIES} attempts") from last_error
+
+
+# ---------------------------------------------------------------------
+# Download one subset
+# ---------------------------------------------------------------------
 
 def download_subset(
     subset: str,
     output_dir: str,
     max_docs: int,
     max_chars: int,
-    use_parquet_mirror: bool = True,
-) -> int:
+) -> Tuple[int, int]:
+
     if subset not in AVAILABLE_SUBSETS:
         raise ValueError(
-            f"Unknown subset '{subset}'. Known compliance-relevant subsets: "
-            f"{sorted(AVAILABLE_SUBSETS)}. See the pile-of-law dataset card "
-            f"on Hugging Face for the full list if you want a different one."
+            f"Unknown subset '{subset}'.\n\n"
+            f"Available subsets:\n"
+            f"  {', '.join(sorted(AVAILABLE_SUBSETS))}\n\n"
+            f"Note: privacy_policies is NOT a current Pile-of-Law subset."
         )
 
-    load_kwargs = dict(
-        path="pile-of-law/pile-of-law",
-        name=subset,
-        split="train",
-        streaming=True,
+    filename = AVAILABLE_SUBSETS[subset]
+    url = BASE_URL + filename
+    output_path = os.path.join(output_dir, f"{subset}.txt")
+
+    print()
+    print("=" * 70)
+    print(f"Downloading subset: {subset}")
+    print(f"Maximum documents: {max_docs:,}")
+    print(
+        f"Maximum characters: {max_chars:,} "
+        f"(~{max_chars // APPROX_CHARS_PER_TOKEN:,} tokens)"
     )
-    if use_parquet_mirror:
-        # Bypasses the dataset's loading script — required on datasets>=3.0,
-        # which no longer executes loading scripts at all (trust_remote_code
-        # included). Falls back to the default (script-based) load below if
-        # the caller explicitly disables this, e.g. on an older pinned
-        # `datasets` version that still supports scripts.
-        load_kwargs["revision"] = "refs/convert/parquet"
+    print("=" * 70)
 
-    try:
-        dataset = load_dataset(**load_kwargs)
-    except Exception as e:
-        if use_parquet_mirror:
-            raise RuntimeError(
-                f"Failed to load subset '{subset}' from the refs/convert/parquet "
-                f"mirror. This branch is auto-generated by the Hub for every "
-                f"dataset, but generation can lag for very large ones — check "
-                f"https://huggingface.co/datasets/pile-of-law/pile-of-law/tree/refs%2Fconvert%2Fparquet "
-                f"to confirm the subset is listed there. Original error: {e}"
-            ) from e
-        raise
+    # Remove an old partial file so that a rerun doesn't accidentally
+    # append duplicate documents.
+    if os.path.exists(output_path):
+        print(f"  Removing existing file: {output_path}")
+        os.remove(output_path)
 
-    out_path = os.path.join(output_dir, f"{subset}.txt")
-    n_docs = 0
-    n_chars = 0
+    with open(output_path, "w", encoding="utf-8") as output_file:
+        n_docs, n_chars = stream_jsonl_xz(
+            url=url,
+            output_file=output_file,
+            max_docs=max_docs,
+            max_chars=max_chars,
+        )
 
-    with open(out_path, "w", encoding="utf-8") as out_f:
-        for example in dataset:
-            text = example.get("text", "")
-            if not text or not text.strip():
-                continue
+    print(f"  Documents written : {n_docs:,}")
+    print(f"  Characters written: {n_chars:,}")
+    print(f"  Output            : {output_path}")
 
-            out_f.write(text.strip() + "\n\n")
-            n_docs += 1
-            n_chars += len(text)
+    return n_docs, n_chars
 
-            if n_docs >= max_docs or n_chars >= max_chars:
-                break
 
-    return n_docs
-
+# ---------------------------------------------------------------------
+# Main corpus downloader
+# ---------------------------------------------------------------------
 
 def download_corpus(
     subsets: List[str],
     output_dir: str,
     max_docs_per_subset: int,
     max_tokens_per_subset: int,
-    use_parquet_mirror: bool = True,
 ) -> None:
+
     os.makedirs(output_dir, exist_ok=True)
     max_chars_per_subset = max_tokens_per_subset * APPROX_CHARS_PER_TOKEN
 
+    total_docs = 0
+    total_chars = 0
+
+    print()
+    print("Pile-of-Law DAPT downloader")
+    print("-" * 70)
+    print(f"Output directory: {output_dir}")
+    print(f"Subsets: {', '.join(subsets)}")
+    print(f"Target tokens/subset: {max_tokens_per_subset:,}")
+    print(f"Maximum documents/subset: {max_docs_per_subset:,}")
+    print("-" * 70)
+
     for subset in subsets:
-        print(f"Downloading '{subset}' (up to {max_docs_per_subset} docs / "
-              f"~{max_tokens_per_subset:,} tokens)...")
-        n_docs = download_subset(
+        n_docs, n_chars = download_subset(
             subset=subset,
             output_dir=output_dir,
             max_docs=max_docs_per_subset,
             max_chars=max_chars_per_subset,
-            use_parquet_mirror=use_parquet_mirror,
         )
-        print(f"  wrote {n_docs} documents to {output_dir}/{subset}.txt")
+        total_docs += n_docs
+        total_chars += n_chars
 
+    print()
+    print("=" * 70)
+    print("DOWNLOAD COMPLETE")
+    print("=" * 70)
+    print(f"Total documents : {total_docs:,}")
+    print(f"Total characters: {total_chars:,}")
+    print(f"Approx. tokens  : {total_chars // APPROX_CHARS_PER_TOKEN:,}")
+    print(f"Output directory: {output_dir}")
+    print("=" * 70)
+
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Stream legal text directly from Pile-of-Law Hugging Face files."
+    )
+
     parser.add_argument(
         "--subsets", nargs="+", default=DEFAULT_SUBSETS,
-        help=f"pile-of-law configs to pull. Known: {sorted(AVAILABLE_SUBSETS)}",
+        help=f"Pile-of-Law subsets to download. Available: {sorted(AVAILABLE_SUBSETS)}",
     )
-    parser.add_argument("--output_dir", default="data/raw/dapt")
-    parser.add_argument("--max_docs_per_subset", type=int, default=1500)
+    parser.add_argument(
+        "--output_dir", default="data/raw/dapt",
+        help="Directory where .txt files will be written.",
+    )
+    parser.add_argument(
+        "--max_docs_per_subset", type=int, default=1500,
+        help="Maximum number of documents per subset.",
+    )
     parser.add_argument(
         "--max_tokens_per_subset", type=int, default=5_000_000,
-        help="Approximate stopping point per subset — real token count is "
-             "measured later by chunk_text.py, this is just to avoid "
-             "over-downloading raw text.",
+        help="Approximate token limit per subset. Exact token count is "
+             "performed later by chunk_text.py.",
     )
-    parser.add_argument(
-        "--no_parquet_mirror", action="store_true",
-        help="Load from the dataset's default (script-based) branch instead of "
-             "refs/convert/parquet. Only useful on an older pinned `datasets` "
-             "version that still executes loading scripts — on datasets>=3.0 "
-             "this will fail the same way the original bug report did.",
-    )
+
     args = parser.parse_args()
 
     download_corpus(
@@ -171,7 +295,6 @@ def main() -> None:
         output_dir=args.output_dir,
         max_docs_per_subset=args.max_docs_per_subset,
         max_tokens_per_subset=args.max_tokens_per_subset,
-        use_parquet_mirror=not args.no_parquet_mirror,
     )
 
 
