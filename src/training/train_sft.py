@@ -79,7 +79,7 @@ def run_sft(config_path: str) -> str:
         num_train_epochs=t["num_train_epochs"],
         learning_rate=t["learning_rate"],
         lr_scheduler_type=t["lr_scheduler_type"],
-        warmup_ratio=t["warmup_ratio"],
+        warmup_steps=t.get("warmup_steps", 100),
         weight_decay=t["weight_decay"],
         logging_steps=t["logging_steps"],
         save_steps=t["save_steps"],
